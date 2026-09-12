@@ -1,84 +1,25 @@
-const sampleSpots = [
-  {name:"草津PA", kind:"PA", km:42.3, minutes:33},
-  {name:"土山SA", kind:"SA", km:78.6, minutes:57},
-  {name:"刈谷PA", kind:"PA", km:164.2, minutes:122},
-  {name:"NEOPASA岡崎", kind:"SA", km:195.8, minutes:143},
-  {name:"EXPASA浜名湖", kind:"SA", km:249.1, minutes:176},
-  {name:"牧之原SA", kind:"SA", km:292.8, minutes:207},
-  {name:"EXPASA足柄", kind:"SA", km:397.4, minutes:281}
-];
+const $=s=>document.querySelector(s);
+const destination=$("#destination"),searchBtn=$("#searchBtn"),locateBtn=$("#locateBtn"),statusEl=$("#status"),spotsEl=$("#spots"),countEl=$("#count"),summary=$("#summary");
+let current=null,watchId=null,route=null,routeLayer=null,currentMarker=null,destMarker=null,saMarkers=[];
 
-const destination = document.querySelector("#destination");
-const searchBtn = document.querySelector("#searchBtn");
-const locateBtn = document.querySelector("#locateBtn");
-const statusEl = document.querySelector("#status");
-const spotsEl = document.querySelector("#spots");
-const countEl = document.querySelector("#count");
-const summaryEl = document.querySelector("#summary");
-const totalDistanceEl = document.querySelector("#totalDistance");
-const etaEl = document.querySelector("#eta");
-const remainingTimeEl = document.querySelector("#remainingTime");
+const map=L.map("map").setView([35.681236,139.767125],6);
+L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",{maxZoom:19,attribution:"&copy; OpenStreetMap contributors"}).addTo(map);
 
-function formatTime(date) {
-  return date.toLocaleTimeString("ja-JP", {hour:"2-digit", minute:"2-digit"});
-}
-
-function render(spots, totalKm, totalMinutes) {
-  const now = new Date();
-  const eta = new Date(now.getTime() + totalMinutes * 60000);
-
-  totalDistanceEl.textContent = `${totalKm.toFixed(1)} km`;
-  etaEl.textContent = formatTime(eta);
-  remainingTimeEl.textContent = `${Math.floor(totalMinutes/60)}時間${totalMinutes%60}分`;
-  summaryEl.classList.remove("hidden");
-
-  spotsEl.innerHTML = spots.map((s, i) => {
-    const arrival = new Date(now.getTime() + s.minutes * 60000);
-    return `
-      <article class="spot">
-        <div class="badge">${s.kind === "SA" ? "S" : "P"}</div>
-        <div>
-          <h3>${s.name}</h3>
-          <p>${s.kind} ・ 到着予定 ${formatTime(arrival)}</p>
-        </div>
-        <div class="distance">
-          <strong>${s.km.toFixed(1)} km</strong>
-          <span>あと ${s.minutes}分</span>
-        </div>
-      </article>`;
-  }).join("");
-  countEl.textContent = `${spots.length}か所`;
-}
-
-function searchRoute() {
-  const dest = destination.value.trim();
-  if (!dest) {
-    statusEl.textContent = "目的地を入力してください。";
-    return;
-  }
-  statusEl.textContent = `「${dest}」へのプロトタイプルートを表示しています。`;
-  // 実運用ではここをルートAPI呼び出しに置き換えます。
-  render(sampleSpots, 496.0, 387);
-}
-
-searchBtn.addEventListener("click", searchRoute);
-destination.addEventListener("keydown", e => {
-  if (e.key === "Enter") searchRoute();
-});
-
-locateBtn.addEventListener("click", () => {
-  if (!navigator.geolocation) {
-    statusEl.textContent = "このブラウザでは位置情報を利用できません。";
-    return;
-  }
-  statusEl.textContent = "現在地を取得しています…";
-  navigator.geolocation.getCurrentPosition(
-    pos => {
-      statusEl.textContent = `現在地を取得しました（緯度 ${pos.coords.latitude.toFixed(4)} / 経度 ${pos.coords.longitude.toFixed(4)}）。`;
-    },
-    () => {
-      statusEl.textContent = "位置情報を取得できませんでした。Safariの位置情報許可を確認してください。";
-    },
-    {enableHighAccuracy:true, timeout:10000}
-  );
-});
+const status=t=>statusEl.textContent=t;
+const time=d=>d.toLocaleTimeString("ja-JP",{hour:"2-digit",minute:"2-digit"});
+const dur=s=>{let m=Math.max(0,Math.round(s/60));return `${Math.floor(m/60)}時間${m%60}分`};
+function hav(a,b){const R=6371000,p=Math.PI/180,d1=(b[0]-a[0])*p,d2=(b[1]-a[1])*p,x=Math.sin(d1/2)**2+Math.cos(a[0]*p)*Math.cos(b[0]*p)*Math.sin(d2/2)**2;return 2*R*Math.asin(Math.sqrt(x))}
+function nearest(lat,lon){let best={i:0,d:Infinity};route.geometry.coordinates.forEach((c,i)=>{let d=hav([lat,lon],[c[1],c[0]]);if(d<best.d)best={i,d}});return best}
+function cum(cs){let a=[0];for(let i=1;i<cs.length;i++)a.push(a[i-1]+hav([cs[i-1][1],cs[i-1][0]],[cs[i][1],cs[i][0]]));return a}
+function gps(){if(!navigator.geolocation)return status("このブラウザではGPSを利用できません。");status("現在地を取得しています…");watchId=navigator.geolocation.watchPosition(p=>{current={lat:p.coords.latitude,lon:p.coords.longitude,accuracy:p.coords.accuracy};if(!currentMarker)currentMarker=L.marker([current.lat,current.lon]).addTo(map).bindPopup("現在地");else currentMarker.setLatLng([current.lat,current.lon]);if(!route)map.setView([current.lat,current.lon],15);else update()},e=>status(e.code===1?"位置情報の利用を許可してください。":"GPSを取得できませんでした。"),{enableHighAccuracy:true,maximumAge:5000,timeout:15000})}
+async function geocode(q){let u="https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&accept-language=ja&q="+encodeURIComponent(q),r=await fetch(u);let d=await r.json();if(!d.length)throw Error("目的地が見つかりませんでした");return{lat:+d[0].lat,lon:+d[0].lon}}
+async function getRoute(a,b){let u=`https://router.project-osrm.org/route/v1/driving/${a.lon},${a.lat};${b.lon},${b.lat}?overview=full&geometries=geojson`,r=await fetch(u),d=await r.json();if(d.code!=="Ok")throw Error("ルートが見つかりませんでした");return d.routes[0]}
+async function getSpots(rt){let cs=rt.geometry.coordinates,lat=cs.map(c=>c[1]),lon=cs.map(c=>c[0]),s=Math.min(...lat)-.12,n=Math.max(...lat)+.12,w=Math.min(...lon)-.12,e=Math.max(...lon)+.12,q=`[out:json][timeout:25];nwr["highway"~"^(services|rest_area)$"](${s},${w},${n},${e});out center tags;`,r=await fetch("https://overpass-api.de/api/interpreter",{method:"POST",headers:{"Content-Type":"text/plain"},body:q}),d=await r.json(),cc=cum(cs),out=[];
+for(const x of d.elements||[]){let la=x.lat??x.center?.lat,lo=x.lon??x.center?.lon;if(la==null)continue;let z=nearest.call({geometry:rt.geometry},la,lo);if(z.d>2500)continue;let name=x.tags?.name||x.tags?.["name:ja"]||"SA・PA",type=x.tags?.highway==="services"?"SA":"PA",km=cc[z.i]/1000;if(km>1&&km<cc.at(-1)/1000-1&&!out.some(v=>v.name===name||hav([v.lat,v.lon],[la,lo])<1000))out.push({name,type,lat:la,lon:lo,km})}return out.sort((a,b)=>a.km-b.km).slice(0,30)}
+function draw(){if(routeLayer)map.removeLayer(routeLayer);routeLayer=L.geoJSON(route.geometry,{style:{weight:5}}).addTo(map);map.fitBounds(routeLayer.getBounds(),{padding:[15,15]});if(destMarker)map.removeLayer(destMarker);destMarker=L.marker([route.dest.lat,route.dest.lon]).addTo(map).bindPopup("目的地")}
+function render(spots){saMarkers.forEach(m=>map.removeLayer(m));saMarkers=[];let now=Date.now(),near=nearest(current.lat,current.lon).i,cc=cum(route.geometry.coordinates),passed=cc[near],total=cc.at(-1),remain=Math.max(0,total-passed),sec=route.duration*remain/total;$("#totalDistance").textContent=(remain/1000).toFixed(1)+" km";$("#eta").textContent=time(new Date(now+sec*1000));$("#remainingTime").textContent=dur(sec);summary.classList.remove("hidden");
+spots=spots.map(x=>({...x,remaining:Math.max(0,x.km*1000-passed)})).filter(x=>x.remaining>500);spotsEl.innerHTML=spots.length?spots.map(x=>{let es=sec*(x.remaining/Math.max(1,remain));return `<article class="spot"><div class="badge">${x.type==="SA"?"S":"P"}</div><div><h3>${x.name}</h3><p>${x.type} ・ 到着予定 ${time(new Date(now+es*1000))}</p></div><div class="distance"><strong>${(x.remaining/1000).toFixed(1)} km</strong><span>あと ${dur(es)}</span></div></article>`}).join(""):`<div class="empty">ルート周辺のSA・PAを取得できませんでした。</div>`;countEl.textContent=spots.length+"か所";spots.forEach(x=>saMarkers.push(L.marker([x.lat,x.lon]).addTo(map).bindPopup(x.name+" "+x.type)))}
+let cached=[];
+function update(){if(route&&current)render(cached)}
+async function search(){if(!current){status("先に⌖を押して現在地を取得してください。");gps();return}let q=destination.value.trim();if(!q)return;searchBtn.disabled=true;try{status("目的地を検索中…");let to=await geocode(q);status("ルートを検索中…");route=await getRoute(current,to);route.dest=to;draw();status("SA・PAを検索中…");cached=await getSpots(route);render(cached);status("GPSで現在地を自動更新しています。")}catch(e){console.error(e);status(e.message||"検索に失敗しました。")}finally{searchBtn.disabled=false}}
+locateBtn.onclick=gps;searchBtn.onclick=search;destination.onkeydown=e=>{if(e.key==="Enter")search()};gps();
