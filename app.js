@@ -2,7 +2,7 @@ const $=s=>document.querySelector(s);
 const destination=$('#destination'),searchBtn=$('#searchBtn'),locateBtn=$('#locateBtn');
 const statusEl=$('#status'),spotsEl=$('#spots'),countEl=$('#count'),summary=$('#summary');
 const routesEl=$('#routes'),routeChoicesEl=$('#routeChoices'),routeCountEl=$('#routeCount');
-let current=null,watchId=null,route=null,routeLayer=null,currentMarker=null,destMarker=null,saMarkers=[],cached=[],routeOptions=[];
+let current=null,watchId=null,route=null,routeLayer=null,currentMarker=null,destMarker=null,saMarkers=[],cached=[],routeOptions=[],routeStart=null;
 const TOKYO=[35.681236,139.767125];
 const map=L.map('map').setView(TOKYO,6);L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'&copy; OpenStreetMap contributors'}).addTo(map);
 const status=t=>statusEl.textContent=t;const time=d=>d.toLocaleTimeString('ja-JP',{hour:'2-digit',minute:'2-digit'});const dur=s=>{const m=Math.max(0,Math.round(s/60));return `${Math.floor(m/60)}時間${m%60}分`;};
@@ -73,7 +73,7 @@ async function osrm(a,b,extra=''){const u=`https://router.project-osrm.org/route
 async function osrmVia(points,extra=''){const coords=points.map(p=>`${p.lon},${p.lat}`).join(';');const u=`https://router.project-osrm.org/route/v1/driving/${coords}?overview=full&geometries=geojson&steps=true&alternatives=false&continue_straight=true${extra}`;const r=await fetch(u);if(!r.ok)return null;const d=await r.json();return d.code==='Ok'&&d.routes?.[0]?d.routes[0]:null;}
 function motorwayScore(rt){let motorway=0,trunk=0,total=0,expressHint=0;for(const leg of rt.legs||[])for(const st of leg.steps||[]){const km=st.distance||0;total+=km;const cls=st.classes||[];const txt=`${st.name||''} ${st.ref||''}`;if(cls.includes('motorway'))motorway+=km;else if(cls.includes('trunk'))trunk+=km;if(/首都高|高速|アクアライン|館山道|富津館山|湾岸|東関東|京葉道路|常磐道|東北道|関越道|中央道|E\d{1,2}/.test(txt))expressHint+=km;}const ratio=total?Math.max((motorway+trunk)/total,expressHint/total):0;return{motorway,trunk,total,ratio};}
 function roadNames(rt){const a=[];for(const leg of rt.legs||[])for(const st of leg.steps||[]){const n=st.name||st.ref;if(n&&!a.includes(n))a.push(n);if(a.length>=5)break;}return a;}
-function classifyRoute(rt,i,kind='auto',meta={}){const s=meta.ratio!=null?{ratio:meta.ratio,total:rt.distance||0}:motorwayScore(rt);let name=kind==='highway'?'高速道路優先':kind==='general'?'一般道中心':(s.ratio>=.65?'高速道路優先':s.ratio>=.35?'高速＋一般道':'一般道中心');return{rt,name,tag:i===0?'おすすめ':'別ルート',mins:Math.round(rt.duration/60),km:(rt.distance/1000).toFixed(1),ratio:s.ratio,roads:meta.roads||roadNames(rt).join(' → '),kind};}
+function classifyRoute(rt,i,kind='auto',meta={}){const s=meta.ratio!=null?{ratio:meta.ratio,total:rt.distance||0}:motorwayScore(rt);let name=kind==='highway'?'高速道路優先':kind==='general'?'一般道優先':'高速＋一般道';return{rt,name,tag:i===0?'おすすめ':'別ルート',mins:Math.round(rt.duration/60),km:(rt.distance/1000).toFixed(1),ratio:s.ratio,roads:meta.roads||roadNames(rt).join(' → '),kind};}
 function decodePolyline6(str){let idx=0,lat=0,lon=0,out=[];while(idx<str.length){let b,shift=0,result=0;do{b=str.charCodeAt(idx++)-63;result|=(b&31)<<shift;shift+=5;}while(b>=32);lat+=result&1?~(result>>1):result>>1;shift=0;result=0;do{b=str.charCodeAt(idx++)-63;result|=(b&31)<<shift;shift+=5;}while(b>=32);lon+=result&1?~(result>>1):result>>1;out.push([lon/1e6,lat/1e6]);}return out;}
 function valhallaShape(trip){const coords=[];for(const leg of trip.legs||[]){const sh=leg.shape;if(Array.isArray(sh)){for(const p of sh)coords.push(Array.isArray(p)?p:[p.lon,p.lat]);}
  else if(sh&&Array.isArray(sh.coordinates))coords.push(...sh.coordinates);
@@ -123,45 +123,78 @@ async function buildForcedHighwayRoutes(a,b){
   return best;
 }
 async function getRoutes(a,b){
-  const candidates=[];
-  // まずICを明示的に経由させた「高速道路優先」を生成する。
+  const result=[];
+
+  // 1) 高速道路優先：ICを明示的に経由させて高速道路利用を強制する。
   try{
     const hs=await buildForcedHighwayRoutes(a,b);
-    for(const h of hs){
-      candidates.push(classifyRoute(h.rt,candidates.length,'highway',{ratio:h.ratio,roads:`${h.oi.name} → 高速道路 → ${h.di.name}`}));
-    }
+    const best=hs
+      .filter(h=>h.rt)
+      .sort((x,y)=>{
+        const ra=x.ratio||0,rb=y.ratio||0;
+        return (rb-ra)*300+(x.rt.duration-y.rt.duration);
+      })[0];
+    if(best) result.push(classifyRoute(best.rt,0,'highway',{ratio:Math.max(best.ratio||0,.35),roads:`${best.oi.name} → 高速道路 → ${best.di.name}`}));
   }catch(e){console.warn('高速道路ルート生成失敗',e);}
-  // 通常ルートとOSRMの代替ルート。
+
+  // 2) 高速＋一般道：通常の最短系ルート。高速利用の有無を実際の道路クラスから判定する。
   try{
     const rs=await osrm(a,b);
-    for(const r of rs)candidates.push(classifyRoute(r,candidates.length,'auto'));
+    if(rs?.[0]) result.push(classifyRoute(rs[0],1,'auto'));
+    if(rs?.[1]) result.push(classifyRoute(rs[1],2,'auto'));
   }catch(e){console.warn('通常ルート生成失敗',e);}
-  // 一般道だけの比較候補。
+
+  // 3) 一般道優先：高速道路を除外したルート。
   try{
     const rr=await osrm(a,b,'&exclude=motorway');
-    if(rr[0])candidates.push(classifyRoute(rr[0],candidates.length,'general'));
+    if(rr?.[0]) result.push(classifyRoute(rr[0],3,'general',{ratio:0,roads:roadNames(rr[0]).join(' → ')}));
   }catch(e){console.warn('一般道ルート生成失敗',e);}
+
+  // 距離・時間がほぼ同じ候補だけ整理し、カテゴリは必ず残す。
   const unique=[];
-  for(const o of candidates){
-    const dup=unique.some(x=>Math.abs(+x.km-(+o.km))<2&&Math.abs(x.mins-o.mins)<5&&x.kind===o.kind);
+  for(const o of result){
+    const dup=unique.some(x=>x.kind===o.kind&&Math.abs(+x.km-(+o.km))<1&&Math.abs(x.mins-o.mins)<3);
     if(!dup)unique.push(o);
   }
-  const highways=unique.filter(x=>x.kind==='highway'&&x.ratio>=.35).slice(0,3);
-  const autos=unique.filter(x=>x.kind==='auto'&&x.ratio>=.20).slice(0,2);
-  const generals=unique.filter(x=>x.kind==='general').slice(0,1);
-  const result=[...highways,...autos,...generals];
-  return (result.length?result:unique).slice(0,6);
+
+  // 同じ「高速＋一般道」が複数ある場合は最短を1つだけ採用。
+  const pick=(kind)=>unique.filter(x=>x.kind===kind).sort((a,b)=>a.rt.duration-b.rt.duration)[0];
+  const highway=pick('highway');
+  const mixed=pick('auto');
+  const general=pick('general');
+  const final=[highway,mixed,general].filter(Boolean);
+
+  // 何らかのAPI障害で高速候補が取れなかった場合でも通常ルートを返す。
+  return (final.length?final:unique).slice(0,3);
 }
 function showRouteChoices(routes){routeOptions=routes;routeCountEl.textContent=routeOptions.length+'ルート';routesEl.classList.remove('hidden');routeChoicesEl.innerHTML=routeOptions.map((o,i)=>`<button class="route-choice ${i===0?'selected':''}" data-index="${i}"><div class="top"><span class="name">${o.name}</span><span class="tag">${o.tag}</span></div><div class="meta"><span>${o.km} km</span><span>${o.mins}分</span><span>高速等 ${Math.round(o.ratio*100)}%</span></div><div class="roads">${o.roads||'経路詳細なし'}</div></button>`).join('');routeChoicesEl.querySelectorAll('.route-choice').forEach(b=>b.onclick=()=>selectRoute(+b.dataset.index));}
-async function selectRoute(i){const o=routeOptions[i];if(!o)return;route=o.rt;route.dest=window.__dest;routeOptions.forEach((_,j)=>{const b=routeChoicesEl.querySelector(`[data-index="${j}"]`);if(b)b.classList.toggle('selected',j===i);});status('選択したルートのSA・PAを検索中…');draw();try{cached=await getSpots(route);render(cached);status(`「${o.name}」を選択中。GPSで現在地を自動更新しています。`);}catch(e){status(e.message||'SA・PA検索に失敗しました。');}}
+async function selectRoute(i){const o=routeOptions[i];if(!o)return;route=o.rt;route.dest=window.__dest;routeStart={lat:current.lat,lon:current.lon};routeOptions.forEach((_,j)=>{const b=routeChoicesEl.querySelector(`[data-index="${j}"]`);if(b)b.classList.toggle('selected',j===i);});status('選択したルートのSA・PAを検索中…');draw();try{cached=await getSpots(route);render(cached);status(`「${o.name}」を選択中。現在地からの残り時間を更新しています。`);}catch(e){status(e.message||'SA・PA検索に失敗しました。');}}
 async function getSpots(rt){const cs=rt.geometry.coordinates,lat=cs.map(c=>c[1]),lon=cs.map(c=>c[0]);const s=Math.min(...lat)-.03,n=Math.max(...lat)+.03,w=Math.min(...lon)-.03,e=Math.max(...lon)+.03;const q=`[out:json][timeout:30];nwr["highway"~"^(services|rest_area)$"](${s},${w},${n},${e});out center tags;`;const r=await fetch('https://overpass-api.de/api/interpreter',{method:'POST',headers:{'Content-Type':'text/plain'},body:q});if(!r.ok)throw Error('SA・PAデータを取得できませんでした');const d=await r.json(),cc=cum(cs),total=cc.at(-1),out=[];const include=/(サービスエリア|パーキングエリア|\bSA\b|\bPA\b|SA・PA|ＳＡ|ＰＡ)/i,exclude=/(道の駅|コインパーキング|駐車場|VIP|ラウンジ|ロータリー|バス停|ガソリンスタンド|サービスステーション)/i;for(const x of d.elements||[]){const la=x.lat??x.center?.lat,lo=x.lon??x.center?.lon;if(la==null||lo==null)continue;const t=x.tags||{},name=t.name||t['name:ja']||'',ja=t['name:ja']||name,label=ja||name;if(!label||exclude.test(label)||(!include.test(name)&&!include.test(ja)))continue;const z=nearestOnRoute(rt,la,lo);if(z.d>120)continue;const km=cc[z.i]/1000;if(km<1||km>total/1000-1)continue;if(current&&Number.isFinite(current.heading)&&current.speed>3&&angleDiff(current.heading,routeBearing(rt,z.i))>75)continue;if(!directionMatches(label,rt,z.i))continue;let type='PA';if(/サービスエリア|\bSA\b|ＳＡ/i.test(label)&&!/パーキングエリア|\bPA\b|ＰＡ/i.test(label))type='SA';if(/SA・PA/i.test(label))type='PA';if(out.some(v=>hav([v.lat,v.lon],[la,lo])<500))continue;out.push({name:label,type,lat:la,lon:lo,km,roadDist:z.d});}return out.sort((a,b)=>a.km-b.km).slice(0,40);}
 function draw(){if(routeLayer)map.removeLayer(routeLayer);routeLayer=L.geoJSON(route.geometry,{style:{weight:5}}).addTo(map);map.fitBounds(routeLayer.getBounds(),{padding:[15,15]});if(destMarker)map.removeLayer(destMarker);destMarker=L.marker([route.dest.lat,route.dest.lon]).addTo(map).bindPopup(`目的地: ${route.dest.label||'目的地'}`);}
-function render(spots){saMarkers.forEach(m=>map.removeLayer(m));saMarkers=[];const now=Date.now(),near=nearestOnRoute(route,current.lat,current.lon),cc=cum(route.geometry.coordinates),passed=cc[near.i],total=cc.at(-1),remain=Math.max(0,total-passed),sec=route.duration*(remain/Math.max(1,total));$('#totalDistance').textContent=(remain/1000).toFixed(1)+' km';$('#eta').textContent=time(new Date(now+sec*1000));$('#remainingTime').textContent=dur(sec);summary.classList.remove('hidden');const active=spots.map(x=>({...x,remaining:Math.max(0,x.km*1000-passed)})).filter(x=>x.remaining>500);spotsEl.innerHTML=active.length?active.map(x=>{const es=sec*(x.remaining/Math.max(1,remain));return`<article class="spot"><div class="badge">${x.type==='SA'?'S':'P'}</div><div><h3>${x.name}</h3><p>${x.type} ・ 到着予定 ${time(new Date(now+es*1000))}</p></div><div class="distance"><strong>${(x.remaining/1000).toFixed(1)} km</strong><span>あと ${dur(es)}</span></div></article>`;}).join(''):`<div class="empty">このルート上で確認できるSA・PAはありません。</div>`;countEl.textContent=active.length+'か所';active.forEach(x=>saMarkers.push(L.marker([x.lat,x.lon]).addTo(map).bindPopup(`${x.name}（${x.type}）`)));}
+function render(spots){
+  if(!route||!current)return;
+  saMarkers.forEach(m=>map.removeLayer(m));saMarkers=[];
+  const now=Date.now();
+  const near=nearestOnRoute(route,current.lat,current.lon);
+  const cc=cum(route.geometry.coordinates);
+  const passed=cc[near.i],total=cc.at(-1),remain=Math.max(0,total-passed);
+  // ETAは「検索地点」ではなく、その時点のGPS現在地から再計算する。
+  // OSRMの所要時間は渋滞を含まないため、表示値はルート検索APIの基準値。
+  const sec=route.duration*(remain/Math.max(1,total));
+  $('#totalDistance').textContent=(remain/1000).toFixed(1)+' km';
+  $('#eta').textContent=time(new Date(now+sec*1000));
+  $('#remainingTime').textContent=dur(sec);
+  summary.classList.remove('hidden');
+  const active=spots.map(x=>({...x,remaining:Math.max(0,x.km*1000-passed)})).filter(x=>x.remaining>500);
+  spotsEl.innerHTML=active.length?active.map(x=>{const es=sec*(x.remaining/Math.max(1,remain));return`<article class="spot"><div class="badge">${x.type==='SA'?'S':'P'}</div><div><h3>${x.name}</h3><p>${x.type} ・ 到着予定 ${time(new Date(now+es*1000))}</p></div><div class="distance"><strong>${(x.remaining/1000).toFixed(1)} km</strong><span>あと ${dur(es)}</span></div></article>`;}).join(''):`<div class="empty">このルート上で確認できるSA・PAはありません。</div>`;
+  countEl.textContent=active.length+'か所';
+  active.forEach(x=>saMarkers.push(L.marker([x.lat,x.lon]).addTo(map).bindPopup(`${x.name}（${x.type}）`)));
+}
 function update(){if(route&&current)render(cached);}
 function showDestinationChoices(cands){const box=$('#destinationChoices');if(!box)return;if(cands.length<=1){box.classList.add('hidden');box.innerHTML='';return;}box.classList.remove('hidden');box.innerHTML=`<div class="section-title"><h2>目的地候補を選択</h2><span>${cands.length}候補</span></div>`+cands.map((c,i)=>`<button class="dest-choice" data-index="${i}"><strong>${c.label}</strong><small>${c.source||''}</small></button>`).join('');box.querySelectorAll('.dest-choice').forEach(b=>b.onclick=()=>selectDestination(+b.dataset.index));}
 let destinationCandidates=[];
 async function selectDestination(i){const to=destinationCandidates[i];if(!to)return;window.__dest=to;showDestinationChoices([]);status(`目的地「${to.label}」を選択しました。高速道路を含む複数ルートを検索中…`);await searchRoutesForDestination(to);}
-async function searchRoutesForDestination(to){try{const routes=await getRoutes(current,to);showRouteChoices(routes);await selectRoute(0);status(`「${routeOptions[0].name}」を選択中。別ルートもタップで選べます。`);}catch(e){console.error(e);status(e.message||'ルート検索に失敗しました。');}}
-async function search(){if(!current){status('先に⌖を押して現在地を取得してください。');gps();return;}const q=destination.value.trim();if(!q)return;searchBtn.disabled=true;try{routesEl.classList.add('hidden');status('目的地の候補を検索中…');destinationCandidates=await geocodeCandidates(q);showDestinationChoices(destinationCandidates);if(destinationCandidates.length===1){window.__dest=destinationCandidates[0];await searchRoutesForDestination(destinationCandidates[0]);}else{status(`${destinationCandidates.length}件の候補があります。正しい目的地を選択してください。`);}}catch(e){console.error(e);status(e.message||'検索に失敗しました。');}finally{searchBtn.disabled=false;}}
+async function searchRoutesForDestination(to){try{const routes=await getRoutes(current,to);showRouteChoices(routes);await selectRoute(0);status(`「${routeOptions[0].name}」を選択中。現在地からのルートです。別ルートもタップで選べます。`);}catch(e){console.error(e);status(e.message||'ルート検索に失敗しました。');}}
+async function search(){if(!current){status('先に⌖を押して現在地を取得してください。');gps();return;}const q=destination.value.trim();if(!q)return;searchBtn.disabled=true;try{routeStart={lat:current.lat,lon:current.lon};routesEl.classList.add('hidden');status('目的地の候補を検索中…');destinationCandidates=await geocodeCandidates(q);showDestinationChoices(destinationCandidates);if(destinationCandidates.length===1){window.__dest=destinationCandidates[0];await searchRoutesForDestination(destinationCandidates[0]);}else{status(`${destinationCandidates.length}件の候補があります。正しい目的地を選択してください。`);}}catch(e){console.error(e);status(e.message||'検索に失敗しました。');}finally{searchBtn.disabled=false;}}
 locateBtn.onclick=gps;searchBtn.onclick=search;destination.onkeydown=e=>{if(e.key==='Enter')search();};gps();
 
