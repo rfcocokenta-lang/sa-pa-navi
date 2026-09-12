@@ -79,33 +79,71 @@ function valhallaShape(trip){const coords=[];for(const leg of trip.legs||[]){con
  else if(sh&&Array.isArray(sh.coordinates))coords.push(...sh.coordinates);
  else if(typeof sh==='string')coords.push(...decodePolyline6(sh).map(([lon,lat])=>[lon,lat]));}
  const unique=[];for(const c of coords){if(!unique.length||c[0]!==unique.at(-1)[0]||c[1]!==unique.at(-1)[1])unique.push(c);}return unique;}
-async function valhallaRoute(a,b,useHighways=1,useTolls=1,alternates=1){
-  const payload={locations:[{lat:a.lat,lon:a.lon,type:'break'},{lat:b.lat,lon:b.lon,type:'break'}],costing:'auto',costing_options:{auto:{use_highways:useHighways,use_tolls:useTolls,use_ferry:0}},units:'kilometers',shape_format:'geojson',directions_options:{units:'kilometers',language:'ja',narrative:false},alternates};
-  const u='https://valhalla1.openstreetmap.de/route?json='+encodeURIComponent(JSON.stringify(payload));
-  const r=await fetch(u,{headers:{'X-Client-Id':'sa-pa-navi-prototype'}});if(!r.ok)throw Error('高速ルートAPIに接続できませんでした');
-  const d=await r.json();if(!d?.trip?.legs?.length)throw Error('高速ルートが見つかりませんでした');
-  const routes=[];
-  const trips=[d.trip,...(d.alternates||[])];
-  for(const trip of trips){const coords=valhallaShape(trip);if(coords.length<2)continue;const rt={geometry:{type:'LineString',coordinates:coords},distance:(trip.summary?.length||0)*1000,duration:(trip.summary?.time||0),legs:[],_engine:'valhalla',_highwayPreference:useHighways};routes.push(rt);}
-  return routes;
+async function motorwayJunctionsAround(lat,lon,km=45){
+  const dLat=km/111, dLon=km/(111*Math.max(0.2,Math.cos(lat*Math.PI/180)));
+  const q=`[out:json][timeout:25];node["highway"="motorway_junction"](${lat-dLat},${lon-dLon},${lat+dLat},${lon+dLon});out tags;`;
+  const r=await fetch('https://overpass-api.de/api/interpreter',{method:'POST',headers:{'Content-Type':'text/plain'},body:q});
+  if(!r.ok)throw Error('高速道路IC情報を取得できませんでした');
+  const d=await r.json();
+  return (d.elements||[]).map(x=>({lat:x.lat,lon:x.lon,name:x.tags?.name||x.tags?.ref||'高速IC',ref:x.tags?.ref||''}))
+    .sort((a,b)=>hav([lat,lon],[a.lat,a.lon])-hav([lat,lon],[b.lat,b.lon]));
 }
-async function getHighwayRoutes(a,b){
-  const out=[];
-  const settings=[[1.0,1.0],[0.85,1.0],[0.7,0.8]];
-  for(const [uh,ut] of settings){try{const rs=await valhallaRoute(a,b,uh,ut,1);for(const r of rs){const sig=`${r.distance.toFixed(0)}-${r.duration.toFixed(0)}`;if(!out.some(x=>Math.abs(x.distance-r.distance)<1800&&Math.abs(x.duration-r.duration)<180))out.push(r);}}catch(e){console.warn('Valhalla highway route failed',e);}}
-  return out.sort((a,b)=>a.duration-b.duration).slice(0,4);
+function routeMotorwayRatio(rt){return motorwayScore(rt).ratio;}
+async function buildForcedHighwayRoutes(a,b){
+  // OSRMの代替ルートだけでは高速道路が返らないことがあるため、
+  // 高速道路ICを経由点として明示的に指定する。
+  const [orig,dest]=await Promise.all([motorwayJunctionsAround(a.lat,a.lon,50),motorwayJunctionsAround(b.lat,b.lon,50)]);
+  const os=orig.slice(0,5), ds=dest.slice(0,6);
+  const pairs=[];
+  for(const oi of os){
+    for(const di of ds){
+      const straight=hav([oi.lat,oi.lon],[di.lat,di.lon]);
+      if(straight<5000)continue;
+      pairs.push({oi,di,score:straight/1000});
+    }
+  }
+  pairs.sort((x,y)=>x.score-y.score);
+  const best=[];
+  for(const pair of pairs.slice(0,10)){
+    try{
+      const rt=await osrmVia([a,pair.oi,pair.di,b]);
+      if(!rt)continue;
+      const ratio=routeMotorwayRatio(rt);
+      if(ratio<0.35)continue;
+      const signature=`${Math.round(rt.distance/1000)}-${Math.round(rt.duration/60)}-${pair.oi.name}-${pair.di.name}`;
+      if(best.some(x=>x.signature===signature))continue;
+      best.push({rt,ratio,oi:pair.oi,di:pair.di,signature});
+    }catch(e){console.warn('IC経由ルート失敗',e);}
+    if(best.length>=4)break;
+  }
+  best.sort((x,y)=>x.rt.duration-y.rt.duration);
+  return best;
 }
 async function getRoutes(a,b){
   const candidates=[];
-  // 高速道路優先を最初に生成。Valhallaはuse_highwaysで高速道路への選好を動的に変えられる。
-  try{const hs=await getHighwayRoutes(a,b);for(const r of hs)candidates.push(classifyRoute(r,candidates.length,'highway',{ratio:.8,roads:'高速道路を優先して検索'}));}catch(e){console.warn(e);}
-  // OSRMの通常候補も比較対象に追加。
-  try{const rs=await osrm(a,b);for(const r of rs)candidates.push(classifyRoute(r,candidates.length,'auto'));}catch(e){console.warn(e);}
-  // 一般道候補は最後に1本だけ。
-  try{const rr=await osrm(a,b,'&exclude=motorway');if(rr[0])candidates.push(classifyRoute(rr[0],candidates.length,'general'));}catch(e){console.warn(e);}
-  const unique=[];for(const o of candidates){const dup=unique.some(x=>Math.abs(+x.km-(+o.km))<2&&Math.abs(x.mins-o.mins)<5&&x.kind===o.kind);if(!dup)unique.push(o);}
-  if(!unique.length)throw Error('ルートが見つかりませんでした');
-  const highways=unique.filter(x=>x.kind==='highway').slice(0,3);
+  // まずICを明示的に経由させた「高速道路優先」を生成する。
+  try{
+    const hs=await buildForcedHighwayRoutes(a,b);
+    for(const h of hs){
+      candidates.push(classifyRoute(h.rt,candidates.length,'highway',{ratio:h.ratio,roads:`${h.oi.name} → 高速道路 → ${h.di.name}`}));
+    }
+  }catch(e){console.warn('高速道路ルート生成失敗',e);}
+  // 通常ルートとOSRMの代替ルート。
+  try{
+    const rs=await osrm(a,b);
+    for(const r of rs)candidates.push(classifyRoute(r,candidates.length,'auto'));
+  }catch(e){console.warn('通常ルート生成失敗',e);}
+  // 一般道だけの比較候補。
+  try{
+    const rr=await osrm(a,b,'&exclude=motorway');
+    if(rr[0])candidates.push(classifyRoute(rr[0],candidates.length,'general'));
+  }catch(e){console.warn('一般道ルート生成失敗',e);}
+  const unique=[];
+  for(const o of candidates){
+    const dup=unique.some(x=>Math.abs(+x.km-(+o.km))<2&&Math.abs(x.mins-o.mins)<5&&x.kind===o.kind);
+    if(!dup)unique.push(o);
+  }
+  const highways=unique.filter(x=>x.kind==='highway'&&x.ratio>=.35).slice(0,3);
   const autos=unique.filter(x=>x.kind==='auto'&&x.ratio>=.20).slice(0,2);
   const generals=unique.filter(x=>x.kind==='general').slice(0,1);
   const result=[...highways,...autos,...generals];
