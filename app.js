@@ -2,6 +2,7 @@ const $ = s => document.querySelector(s);
 const destination = $('#destination'), searchBtn = $('#searchBtn'), locateBtn = $('#locateBtn');
 const statusEl = $('#status'), spotsEl = $('#spots'), countEl = $('#count'), summary = $('#summary');
 let current = null, watchId = null, route = null, routeLayer = null, currentMarker = null, destMarker = null, saMarkers = [], cached = [];
+const TOKYO = [35.681236,139.767125];
 
 const map = L.map('map').setView([35.681236,139.767125], 6);
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom:19, attribution:'&copy; OpenStreetMap contributors'}).addTo(map);
@@ -11,13 +12,29 @@ const dur = s => { const m=Math.max(0,Math.round(s/60)); return `${Math.floor(m/
 function hav(a,b){const R=6371000,p=Math.PI/180,d1=(b[0]-a[0])*p,d2=(b[1]-a[1])*p,x=Math.sin(d1/2)**2+Math.cos(a[0]*p)*Math.cos(b[0]*p)*Math.sin(d2/2)**2;return 2*R*Math.asin(Math.sqrt(x));}
 function cum(cs){const a=[0];for(let i=1;i<cs.length;i++)a.push(a[i-1]+hav([cs[i-1][1],cs[i-1][0]],[cs[i][1],cs[i][0]]));return a;}
 function nearestOnRoute(rt,lat,lon){let best={i:0,d:Infinity};rt.geometry.coordinates.forEach((c,i)=>{const d=hav([lat,lon],[c[1],c[0]]);if(d<best.d)best={i,d};});return best;}
+function bearing(a,b){const p=Math.PI/180,y1=a[0]*p,y2=b[0]*p,dl=(b[1]-a[1])*p;const y=Math.sin(dl)*Math.cos(y2),x=Math.cos(y1)*Math.sin(y2)-Math.sin(y1)*Math.cos(y2)*Math.cos(dl);return (Math.atan2(y,x)*180/Math.PI+360)%360;}
+function angleDiff(a,b){return Math.abs(((a-b+540)%360)-180);}
+function routeBearing(rt,i){const cs=rt.geometry.coordinates;const a=cs[Math.max(0,i-1)],b=cs[Math.min(cs.length-1,i+1)];return a&&b?bearing([a[1],a[0]],[b[1],b[0]]):0;}
+function destinationDirectionFromTokyo(lat,lon){return bearing(TOKYO,[lat,lon]);}
+function directionMatches(label,la,lo,rt,i){
+  const hasUp=/上り|東京方面|都心方面|内回り/i.test(label);
+  const hasDown=/下り|下り線|地方方面|外回り/i.test(label);
+  if(!hasUp&&!hasDown) return true;
+  const rb=routeBearing(rt,i);
+  const toTokyo=bearing([la,lo],TOKYO);
+  // 「上り」は原則東京方向、「下り」は東京から離れる方向という全国共通の概念を使う。
+  // 都市高速の内回り/外回りはラベルだけで断定せず、位置と走行方向の一致を補助判定する。
+  if(hasUp) return angleDiff(rb,toTokyo)<110;
+  if(hasDown) return angleDiff(rb,toTokyo)>=70;
+  return true;
+}
 
 function gps(){
   if(!navigator.geolocation) return status('このブラウザではGPSを利用できません。');
   status('現在地を取得しています…');
   if(watchId!==null) navigator.geolocation.clearWatch(watchId);
   watchId=navigator.geolocation.watchPosition(p=>{
-    current={lat:p.coords.latitude,lon:p.coords.longitude,accuracy:p.coords.accuracy};
+    current={lat:p.coords.latitude,lon:p.coords.longitude,accuracy:p.coords.accuracy,heading:p.coords.heading,speed:p.coords.speed||0};
     if(!currentMarker) currentMarker=L.marker([current.lat,current.lon]).addTo(map).bindPopup('現在地'); else currentMarker.setLatLng([current.lat,current.lon]);
     if(!route) map.setView([current.lat,current.lon],15); else update();
   },e=>status(e.code===1?'位置情報の利用を許可してください。':'GPSを取得できませんでした。'),{enableHighAccuracy:true,maximumAge:5000,timeout:15000});
@@ -81,9 +98,14 @@ async function getSpots(rt){
 
     // ルート上への距離を厳しく制限。1.8kmでは一般道の施設まで混ざるため、350m以内だけ採用。
     const z=nearestOnRoute(rt,la,lo);
-    if(z.d>350) continue;
+    if(z.d>120) continue;
     const km=cc[z.i]/1000;
     if(km<1 || km>total/1000-1) continue;
+    const rb=routeBearing(rt,z.i);
+    if(current && Number.isFinite(current.heading) && current.speed>3){
+      if(angleDiff(current.heading,rb)>75) continue;
+    }
+    if(!directionMatches(label,la,lo,rt,z.i)) continue;
 
     // 上り/下り・東行き/西行き等の表記は残す。
     let type='PA';
