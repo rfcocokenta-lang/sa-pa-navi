@@ -151,56 +151,88 @@ async function valhallaCandidates(a,b){
 }
 async function getRoutes(a,b){
   const candidates=[];
+  const seenKinds=new Set();
 
-  // 最優先：高速利用度を指定できるValhallaで3系統を別々に生成。
+  // 1) 高速道路優先：高速ICを明示的な経由点にしてOSRMで実ルートを生成。
+  //    これをValhallaより先に行うことで、Valhalla障害時でも高速候補を失わない。
   try{
-    const vs=await valhallaCandidates(a,b);
-    for(const v of vs){
-      candidates.push(classifyRoute(v.rt,candidates.length,v.kind==='highway'?'highway':v.kind==='general'?'general':'auto',{
-        ratio:v.ratio,
-        roads:roadNames(v.rt).join(' → ')||v.label
-      }));
-      candidates.at(-1).name=v.label;
-      candidates.at(-1).kind=v.kind;
-      candidates.at(-1).tag=v.kind==='highway'?'おすすめ':'別ルート';
+    const forced=await buildForcedHighwayRoutes(a,b);
+    if(forced.length){
+      const best=forced[0];
+      const o=classifyRoute(best.rt,0,'highway',{ratio:best.ratio,roads:roadNames(best.rt).join(' → ')});
+      o.name='高速道路優先'; o.kind='highway'; o.tag='おすすめ';
+      candidates.push(o); seenKinds.add('highway');
     }
-  }catch(e){console.warn('Valhalla 3-route generation failed',e);}
+  }catch(e){console.warn('Forced highway route failed',e);}
 
-  // Valhallaで不足した場合のみ、既存OSRMルートを補完に使用。
+  // 2) 高速＋一般道：通常のOSRM最短/最速候補。
+  try{
+    const rs=await osrm(a,b);
+    if(rs.length){
+      // 高速候補とほぼ同じルートなら別候補として成立しないので、別形状を優先。
+      const mixed=rs.find(r=>!candidates.some(o=>routeSimilar(o.rt,r)) ) || rs[0];
+      const o=classifyRoute(mixed,candidates.length,'auto');
+      o.name='高速＋一般道'; o.kind='mixed'; o.tag='別ルート';
+      candidates.push(o); seenKinds.add('mixed');
+    }
+  }catch(e){console.warn('OSRM mixed route failed',e);}
+
+  // 3) 一般道優先：motorwayを除外して検索。
+  try{
+    const rs=await osrm(a,b,'&exclude=motorway');
+    if(rs.length){
+      const general=rs.find(r=>!candidates.some(o=>routeSimilar(o.rt,r))) || rs[0];
+      const o=classifyRoute(general,candidates.length,'general');
+      o.name='一般道優先'; o.kind='general'; o.tag='別ルート';
+      candidates.push(o); seenKinds.add('general');
+    }
+  }catch(e){console.warn('OSRM general route failed',e);}
+
+  // OSRMだけで不足した場合はValhallaを補完に利用。
+  if(candidates.length<3){
+    try{
+      const vs=await valhallaCandidates(a,b);
+      for(const v of vs){
+        if(candidates.some(o=>o.kind===v.kind))continue;
+        const o=classifyRoute(v.rt,candidates.length,v.kind==='highway'?'highway':v.kind==='general'?'general':'auto',{
+          ratio:v.ratio,roads:roadNames(v.rt).join(' → ')||v.label
+        });
+        o.name=v.label; o.kind=v.kind; o.tag=o.kind==='highway'?'おすすめ':'別ルート';
+        candidates.push(o);
+        if(candidates.length>=3)break;
+      }
+    }catch(e){console.warn('Valhalla fallback failed',e);}
+  }
+
+  // 最終的に同一系統しか取れない場合でも、OSRM alternativesから未重複候補を補完。
   if(candidates.length<3){
     try{
       const rs=await osrm(a,b);
-      for(const r of rs)candidates.push(classifyRoute(r,candidates.length,'auto'));
-    }catch(e){console.warn('OSRM alternatives failed',e);}
-  }
-  if(candidates.length<3){
-    try{
-      const rr=await osrm(a,b,'&exclude=motorway');
-      if(rr[0])candidates.push(classifyRoute(rr[0],candidates.length,'general'));
-    }catch(e){console.warn('OSRM general failed',e);}
-  }
-
-  // 重複除去。ただし「高速・混合・一般」は同じ距離でも別候補として残す。
-  const unique=[];
-  for(const o of candidates){
-    const dup=unique.some(x=>x.kind===o.kind&&Math.abs(+x.km-(+o.km))<0.8&&Math.abs(x.mins-o.mins)<3);
-    if(!dup)unique.push(o);
+      for(const r of rs){
+        if(candidates.some(o=>routeSimilar(o.rt,r)))continue;
+        const o=classifyRoute(r,candidates.length,'auto');
+        o.kind=candidates.length===0?'highway':candidates.length===1?'mixed':'general';
+        o.name=['高速道路優先','高速＋一般道','一般道優先'][candidates.length];
+        o.tag=candidates.length===0?'おすすめ':'別ルート';
+        candidates.push(o);
+        if(candidates.length>=3)break;
+      }
+    }catch(e){console.warn('OSRM final alternatives failed',e);}
   }
 
-  const pick={highway:unique.find(x=>x.kind==='highway'),mixed:unique.find(x=>x.kind==='mixed'),general:unique.find(x=>x.kind==='general')};
-  // API側の分類が想定と違っても、3系統を必ず異なる候補として組み立てる。
-  const ordered=[];
-  for(const k of ['highway','mixed','general'])if(pick[k]&&!ordered.includes(pick[k]))ordered.push(pick[k]);
-  for(const o of unique)if(ordered.length<3&&!ordered.includes(o))ordered.push(o);
-
-  // 表示名は3系統を明示。高速・混合・一般の順を維持。
-  ordered.slice(0,3).forEach((o,i)=>{
-    if(i===0)o.name='高速道路優先';
-    else if(i===1)o.name='高速＋一般道';
-    else o.name='一般道優先';
+  // 表示順を固定。
+  const order={highway:0,mixed:1,general:2};
+  candidates.sort((x,y)=>(order[x.kind]??9)-(order[y.kind]??9));
+  candidates.slice(0,3).forEach((o,i)=>{
+    o.name=['高速道路優先','高速＋一般道','一般道優先'][i];
     o.tag=i===0?'おすすめ':'別ルート';
   });
-  return ordered.slice(0,3);
+  return candidates.slice(0,3);
+}
+function routeSimilar(a,b){
+  if(!a||!b)return false;
+  const ak=a.distance||0,bk=b.distance||0,at=a.duration||0,bt=b.duration||0;
+  return Math.abs(ak-bk)<800 && Math.abs(at-bt)<180;
 }
 function showRouteChoices(routes){routeOptions=routes;routeCountEl.textContent=routeOptions.length+'ルート';routesEl.classList.remove('hidden');routeChoicesEl.innerHTML=routeOptions.map((o,i)=>`<button class="route-choice ${i===0?'selected':''}" data-index="${i}"><div class="top"><span class="name">${o.name}</span><span class="tag">${o.tag}</span></div><div class="meta"><span>${o.km} km</span><span>${o.mins}分</span><span>高速等 ${Math.round(o.ratio*100)}%</span></div><div class="roads">${o.roads||'経路詳細なし'}</div></button>`).join('');routeChoicesEl.querySelectorAll('.route-choice').forEach(b=>b.onclick=()=>selectRoute(+b.dataset.index));}
 async function selectRoute(i){const o=routeOptions[i];if(!o)return;route=o.rt;route.dest=window.__dest;routeOptions.forEach((_,j)=>{const b=routeChoicesEl.querySelector(`[data-index="${j}"]`);if(b)b.classList.toggle('selected',j===i);});status('選択したルートのSA・PAを検索中…');draw();try{cached=await getSpots(route);render(cached);status(`「${o.name}」を選択中。GPSで現在地を自動更新しています。`);}catch(e){status(e.message||'SA・PA検索に失敗しました。');}}
