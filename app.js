@@ -71,7 +71,7 @@ async function geocodeCandidates(q){
 async function geocode(q){return (await geocodeCandidates(q))[0];}
 async function osrm(a,b,extra=''){const u=`https://router.project-osrm.org/route/v1/driving/${a.lon},${a.lat};${b.lon},${b.lat}?overview=full&geometries=geojson&steps=true&alternatives=true${extra}`;const r=await fetch(u);if(!r.ok)throw Error('ルートAPIに接続できませんでした');const d=await r.json();if(d.code!=='Ok'||!d.routes?.length)throw Error('ルートが見つかりませんでした');return d.routes;}
 async function osrmVia(points,extra=''){const coords=points.map(p=>`${p.lon},${p.lat}`).join(';');const u=`https://router.project-osrm.org/route/v1/driving/${coords}?overview=full&geometries=geojson&steps=true&alternatives=false&continue_straight=true${extra}`;const r=await fetch(u);if(!r.ok)return null;const d=await r.json();return d.code==='Ok'&&d.routes?.[0]?d.routes[0]:null;}
-function motorwayScore(rt){let motorway=0,trunk=0,total=0;for(const leg of rt.legs||[])for(const st of leg.steps||[]){const km=st.distance||0;total+=km;const cls=st.classes||[];if(cls.includes('motorway'))motorway+=km;else if(cls.includes('trunk'))trunk+=km;}return{motorway,trunk,total,ratio:total?(motorway+trunk)/total:0};}
+function motorwayScore(rt){let motorway=0,trunk=0,total=0,expressHint=0;for(const leg of rt.legs||[])for(const st of leg.steps||[]){const km=st.distance||0;total+=km;const cls=st.classes||[];const txt=`${st.name||''} ${st.ref||''}`;if(cls.includes('motorway'))motorway+=km;else if(cls.includes('trunk'))trunk+=km;if(/首都高|高速|アクアライン|館山道|富津館山|湾岸|東関東|京葉道路|常磐道|東北道|関越道|中央道|E\d{1,2}/.test(txt))expressHint+=km;}const ratio=total?Math.max((motorway+trunk)/total,expressHint/total):0;return{motorway,trunk,total,ratio};}
 function roadNames(rt){const a=[];for(const leg of rt.legs||[])for(const st of leg.steps||[]){const n=st.name||st.ref;if(n&&!a.includes(n))a.push(n);if(a.length>=5)break;}return a;}
 function classifyRoute(rt,i,kind='auto',meta={}){const s=meta.ratio!=null?{ratio:meta.ratio,total:rt.distance||0}:motorwayScore(rt);let name=kind==='highway'?'高速道路優先':kind==='general'?'一般道中心':(s.ratio>=.65?'高速道路優先':s.ratio>=.35?'高速＋一般道':'一般道中心');return{rt,name,tag:i===0?'おすすめ':'別ルート',mins:Math.round(rt.duration/60),km:(rt.distance/1000).toFixed(1),ratio:s.ratio,roads:meta.roads||roadNames(rt).join(' → '),kind};}
 function decodePolyline6(str){let idx=0,lat=0,lon=0,out=[];while(idx<str.length){let b,shift=0,result=0;do{b=str.charCodeAt(idx++)-63;result|=(b&31)<<shift;shift+=5;}while(b>=32);lat+=result&1?~(result>>1):result>>1;shift=0;result=0;do{b=str.charCodeAt(idx++)-63;result|=(b&31)<<shift;shift+=5;}while(b>=32);lon+=result&1?~(result>>1):result>>1;out.push([lon/1e6,lat/1e6]);}return out;}
@@ -109,10 +109,13 @@ async function buildForcedHighwayRoutes(a,b){
       const rt=await osrmVia([a,pair.oi,pair.di,b]);
       if(!rt)continue;
       const ratio=routeMotorwayRatio(rt);
-      if(ratio<0.35)continue;
+      // ICを明示的に2か所通過させたルートは、高速候補として採用する。
+      // 公開OSRMによっては steps.classes が返らないため、classesだけで棄却しない。
+      const forcedRatio = ratio>=0.15 ? ratio : 0.55;
+
       const signature=`${Math.round(rt.distance/1000)}-${Math.round(rt.duration/60)}-${pair.oi.name}-${pair.di.name}`;
       if(best.some(x=>x.signature===signature))continue;
-      best.push({rt,ratio,oi:pair.oi,di:pair.di,signature});
+      best.push({rt,ratio:forcedRatio,oi:pair.oi,di:pair.di,signature});
     }catch(e){console.warn('IC経由ルート失敗',e);}
     if(best.length>=4)break;
   }
