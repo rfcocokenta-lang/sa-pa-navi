@@ -71,19 +71,62 @@ async function geocodeCandidates(q){
 async function geocode(q){return (await geocodeCandidates(q))[0];}
 async function osrm(a,b,extra=''){const u=`https://router.project-osrm.org/route/v1/driving/${a.lon},${a.lat};${b.lon},${b.lat}?overview=full&geometries=geojson&steps=true&alternatives=true${extra}`;const r=await fetch(u);if(!r.ok)throw Error('ルートAPIに接続できませんでした');const d=await r.json();if(d.code!=='Ok'||!d.routes?.length)throw Error('ルートが見つかりませんでした');return d.routes;}
 async function osrmVia(points,extra=''){const coords=points.map(p=>`${p.lon},${p.lat}`).join(';');const u=`https://router.project-osrm.org/route/v1/driving/${coords}?overview=full&geometries=geojson&steps=true&alternatives=false&continue_straight=true${extra}`;const r=await fetch(u);if(!r.ok)return null;const d=await r.json();return d.code==='Ok'&&d.routes?.[0]?d.routes[0]:null;}
-function motorwayScore(rt){let motorway=0,trunk=0,total=0,expressHint=0;for(const leg of rt.legs||[])for(const st of leg.steps||[]){const km=st.distance||0;total+=km;const cls=st.classes||[];const txt=`${st.name||''} ${st.ref||''}`;if(cls.includes('motorway'))motorway+=km;else if(cls.includes('trunk'))trunk+=km;if(/首都高|高速|アクアライン|館山道|富津館山|湾岸|東関東|京葉道路|常磐道|東北道|関越道|中央道|E\d{1,2}/.test(txt))expressHint+=km;}const ratio=total?Math.max((motorway+trunk)/total,expressHint/total):0;return{motorway,trunk,total,ratio};}
-function roadNames(rt){
-  const a=[];
-  const add=n=>{if(!n)return; n=String(n).trim(); if(!n)return; if(!a.includes(n))a.push(n);};
+function stepRoadLabel(st){
+  const name=String(st.name||'').trim();
+  const ref=String(st.ref||'').trim();
+  if(name&&ref&&name!==ref)return `${name} (${ref})`;
+  return name||ref||'名称不明';
+}
+function stepIsHighway(st){
+  const cls=Array.isArray(st.classes)?st.classes:[];
+  if(cls.includes('motorway'))return true;
+  const txt=`${st.name||''} ${st.ref||''} ${st.destinations||''}`;
+  // 日本の高速道路・都市高速で実際に使われる名称/路線番号を優先して判定する。
+  return /(首都高速|首都高|中央環状線|湾岸線|京葉道路|東関東自動車道|東関東道|館山自動車道|館山道|富津館山道路|富津館山道|東京湾アクアライン|アクアライン|東京湾横断道路|E14|E51|E1A|E20|E4|E6|E17|E18|E19|E50|E1\b|E2\b)/i.test(txt);
+}
+function analyzeRoute(rt){
+  const segments=[];
+  let total=0, highwayDistance=0, hasStepData=false;
   for(const leg of rt.legs||[]){
     for(const st of leg.steps||[]){
-      const name=(st.name||'').trim();
-      const ref=(st.ref||'').trim();
-      const combined=name&&ref&&name!==ref?`${name} (${ref})`:name||ref;
-      add(combined);
-      if(a.length>=8)break;
+      hasStepData=true;
+      const distance=Number(st.distance)||0;
+      const isHighway=stepIsHighway(st);
+      const label=stepRoadLabel(st);
+      total+=distance;
+      if(isHighway)highwayDistance+=distance;
+      const last=segments.at(-1);
+      if(last && last.isHighway===isHighway && last.label===label){
+        last.distance+=distance; last.toKm=total/1000;
+      }else{
+        segments.push({label,isHighway,distance,fromKm:(total-distance)/1000,toKm:total/1000});
+      }
     }
-    if(a.length>=8)break;
+  }
+  if(!hasStepData)return {hasStepData:false,segments:[],highwayDistance:0,highwayRatio:null,highwayStart:null,highwayEnd:null};
+  const highwaySegments=segments.filter(x=>x.isHighway&&x.distance>0);
+  const first=highwaySegments[0], last=highwaySegments.at(-1);
+  return {
+    hasStepData:true,segments,total,highwayDistance,
+    highwayRatio:total?highwayDistance/total:0,
+    highwayStart:first?{label:first.label,km:first.fromKm}:null,
+    highwayEnd:last?{label:last.label,km:last.toKm}:null
+  };
+}
+function motorwayScore(rt){
+  const a=analyzeRoute(rt);
+  if(!a.hasStepData)return{motorway:0,trunk:0,total:rt.distance||0,ratio:null};
+  return{motorway:a.highwayDistance,trunk:0,total:a.total,ratio:a.highwayRatio};
+}
+function roadNames(rt){
+  const a=[];
+  const add=n=>{if(!n||n==='名称不明')return; n=String(n).trim(); if(!a.includes(n))a.push(n);};
+  for(const leg of rt.legs||[]){
+    for(const st of leg.steps||[]){
+      add(stepRoadLabel(st));
+      if(a.length>=10)break;
+    }
+    if(a.length>=10)break;
   }
   return a.join(' → ');
 }
@@ -94,7 +137,33 @@ function routeRoadSummary(rt,kind){
   if(kind==='general')return '一般道経由（道路名取得なし）';
   return '道路名取得なし';
 }
-function classifyRoute(rt,i,kind='auto',meta={}){const s=meta.ratio!=null?{ratio:meta.ratio,total:rt.distance||0}:motorwayScore(rt);let name=kind==='highway'?'高速道路優先':kind==='general'?'一般道中心':(s.ratio>=.65?'高速道路優先':s.ratio>=.35?'高速＋一般道':'一般道中心');return{rt,name,tag:i===0?'おすすめ':'別ルート',mins:Math.round(rt.duration/60),km:(rt.distance/1000).toFixed(1),ratio:s.ratio,roads:meta.roads||routeRoadSummary(rt,kind),kind};}
+function segmentSummary(rt){
+  const a=analyzeRoute(rt);
+  if(!a.hasStepData)return {text:'区間判定情報なし',transition:'',segments:[],analysis:a};
+  const compact=[];
+  for(const s of a.segments){
+    const label=s.label==='名称不明'?(s.isHighway?'高速道路':'一般道'):s.label;
+    const last=compact.at(-1);
+    if(last && last.isHighway===s.isHighway && last.label===label){last.toKm=s.toKm;}
+    else compact.push({label,isHighway:s.isHighway,fromKm:s.fromKm,toKm:s.toKm});
+  }
+  const text=compact.map(s=>`${s.isHighway?'高速':'一般道'} ${s.fromKm.toFixed(1)}–${s.toKm.toFixed(1)}km`).join(' → ');
+  let transition='';
+  if(a.highwayStart&&a.highwayEnd){
+    transition=`高速道路開始: ${a.highwayStart.label}（約${a.highwayStart.km.toFixed(1)}km） ／ 高速道路終了: ${a.highwayEnd.label}（約${a.highwayEnd.km.toFixed(1)}km）`;
+  }else if(a.highwayRatio===0){
+    transition='高速道路区間なし（判定できた範囲）';
+  }else{
+    transition='高速道路の開始・終了地点を特定できませんでした。';
+  }
+  return {text,transition,segments:compact,analysis:a};
+}
+function classifyRoute(rt,i,kind='auto',meta={}){
+  const a=analyzeRoute(rt);
+  const ratio=meta.ratio!=null?meta.ratio:a.highwayRatio;
+  let name=kind==='highway'?'高速道路優先':kind==='general'?'一般道中心':(ratio!=null&&ratio>=.65?'高速道路優先':ratio!=null&&ratio>=.35?'高速＋一般道':'一般道中心');
+  return{rt,name,tag:i===0?'おすすめ':'別ルート',mins:Math.round(rt.duration/60),km:(rt.distance/1000).toFixed(1),ratio,roads:meta.roads||routeRoadSummary(rt,kind),kind,analysis:a};
+}
 function decodePolyline6(str){let idx=0,lat=0,lon=0,out=[];while(idx<str.length){let b,shift=0,result=0;do{b=str.charCodeAt(idx++)-63;result|=(b&31)<<shift;shift+=5;}while(b>=32);lat+=result&1?~(result>>1):result>>1;shift=0;result=0;do{b=str.charCodeAt(idx++)-63;result|=(b&31)<<shift;shift+=5;}while(b>=32);lon+=result&1?~(result>>1):result>>1;out.push([lon/1e6,lat/1e6]);}return out;}
 function valhallaShape(trip){const coords=[];for(const leg of trip.legs||[]){const sh=leg.shape;if(Array.isArray(sh)){for(const p of sh)coords.push(Array.isArray(p)?p:[p.lon,p.lat]);}
  else if(sh&&Array.isArray(sh.coordinates))coords.push(...sh.coordinates);
@@ -129,14 +198,14 @@ async function buildForcedHighwayRoutes(a,b){
     try{
       const rt=await osrmVia([a,pair.oi,pair.di,b]);
       if(!rt)continue;
-      const ratio=routeMotorwayRatio(rt);
-      // ICを明示的に2か所通過させたルートは、高速候補として採用する。
-      // 公開OSRMによっては steps.classes が返らないため、classesだけで棄却しない。
-      const forcedRatio = ratio>=0.15 ? ratio : 0.55;
+      const analysis=analyzeRoute(rt);
+      const ratio=analysis.highwayRatio;
+      // 「高速道路優先」と表示する以上、実際のstep情報から高速区間を検出できる候補だけ採用する。
+      if(ratio==null || analysis.highwayDistance < 5000) continue;
 
       const signature=`${Math.round(rt.distance/1000)}-${Math.round(rt.duration/60)}-${pair.oi.name}-${pair.di.name}`;
       if(best.some(x=>x.signature===signature))continue;
-      best.push({rt,ratio:forcedRatio,oi:pair.oi,di:pair.di,signature});
+      best.push({rt,ratio,oi:pair.oi,di:pair.di,signature});
     }catch(e){console.warn('IC経由ルート失敗',e);}
     if(best.length>=4)break;
   }
@@ -164,7 +233,7 @@ async function valhallaCandidates(a,b){
   for(const sp of specs){
     try{
       const rt=await valhallaRoute(a,b,sp.use);
-      const ratio=motorwayScore(rt).ratio;
+      const ratio=analyzeRoute(rt).highwayRatio;
       out.push({rt,kind:sp.kind,label:sp.label,ratio});
     }catch(e){console.warn('Valhalla',sp.kind,e);}
   }
@@ -255,7 +324,7 @@ function routeSimilar(a,b){
   const ak=a.distance||0,bk=b.distance||0,at=a.duration||0,bt=b.duration||0;
   return Math.abs(ak-bk)<800 && Math.abs(at-bt)<180;
 }
-function showRouteChoices(routes){routeOptions=routes;routeCountEl.textContent=routeOptions.length+'ルート';routesEl.classList.remove('hidden');routeChoicesEl.innerHTML=routeOptions.map((o,i)=>`<button class="route-choice ${i===0?'selected':''}" data-index="${i}"><div class="top"><span class="name">${o.name}</span><span class="tag">${o.tag}</span></div><div class="meta"><span>${o.km} km</span><span>${o.mins}分</span><span>高速等 ${Math.round(o.ratio*100)}%</span></div><div class="roads">${o.roads||'経路詳細なし'}</div></button>`).join('');routeChoicesEl.querySelectorAll('.route-choice').forEach(b=>b.onclick=()=>selectRoute(+b.dataset.index));}
+function showRouteChoices(routes){routeOptions=routes;routeCountEl.textContent=routeOptions.length+'ルート';routesEl.classList.remove('hidden');routeChoicesEl.innerHTML=routeOptions.map((o,i)=>{const a=o.analysis||analyzeRoute(o.rt);const pct=a.highwayRatio==null?'判定情報不足':Math.round(a.highwayRatio*100)+'%';const seg=a.hasStepData?segmentSummary(o.rt):{text:'区間判定情報なし',transition:''};return`<button class="route-choice ${i===0?'selected':''}" data-index="${i}"><div class="top"><span class="name">${o.name}</span><span class="tag">${o.tag}</span></div><div class="meta"><span>${o.km} km</span><span>${o.mins}分</span><span>高速等 ${pct}</span></div><div class="roads">${o.roads||'経路詳細なし'}</div><div class="segments">${seg.text}</div><div class="transition">${seg.transition}</div></button>`;}).join('');routeChoicesEl.querySelectorAll('.route-choice').forEach(b=>b.onclick=()=>selectRoute(+b.dataset.index));}
 async function selectRoute(i){const o=routeOptions[i];if(!o)return;route=o.rt;route.dest=window.__dest;routeOptions.forEach((_,j)=>{const b=routeChoicesEl.querySelector(`[data-index="${j}"]`);if(b)b.classList.toggle('selected',j===i);});status('選択したルートのSA・PAを検索中…');draw();try{cached=await getSpots(route);render(cached);status(`「${o.name}」を選択中。GPSで現在地を自動更新しています。`);}catch(e){status(e.message||'SA・PA検索に失敗しました。');}}
 async function getSpots(rt){const cs=rt.geometry.coordinates,lat=cs.map(c=>c[1]),lon=cs.map(c=>c[0]);const s=Math.min(...lat)-.03,n=Math.max(...lat)+.03,w=Math.min(...lon)-.03,e=Math.max(...lon)+.03;const q=`[out:json][timeout:30];nwr["highway"~"^(services|rest_area)$"](${s},${w},${n},${e});out center tags;`;const r=await fetch('https://overpass-api.de/api/interpreter',{method:'POST',headers:{'Content-Type':'text/plain'},body:q});if(!r.ok)throw Error('SA・PAデータを取得できませんでした');const d=await r.json(),cc=cum(cs),total=cc.at(-1),out=[];const include=/(サービスエリア|パーキングエリア|\bSA\b|\bPA\b|SA・PA|ＳＡ|ＰＡ)/i,exclude=/(道の駅|コインパーキング|駐車場|VIP|ラウンジ|ロータリー|バス停|ガソリンスタンド|サービスステーション)/i;for(const x of d.elements||[]){const la=x.lat??x.center?.lat,lo=x.lon??x.center?.lon;if(la==null||lo==null)continue;const t=x.tags||{},name=t.name||t['name:ja']||'',ja=t['name:ja']||name,label=ja||name;if(!label||exclude.test(label)||(!include.test(name)&&!include.test(ja)))continue;const z=nearestOnRoute(rt,la,lo);if(z.d>120)continue;const km=cc[z.i]/1000;if(km<1||km>total/1000-1)continue;if(current&&Number.isFinite(current.heading)&&current.speed>3&&angleDiff(current.heading,routeBearing(rt,z.i))>75)continue;if(!directionMatches(label,rt,z.i))continue;let type='PA';if(/サービスエリア|\bSA\b|ＳＡ/i.test(label)&&!/パーキングエリア|\bPA\b|ＰＡ/i.test(label))type='SA';if(/SA・PA/i.test(label))type='PA';if(out.some(v=>hav([v.lat,v.lon],[la,lo])<500))continue;out.push({name:label,type,lat:la,lon:lo,km,roadDist:z.d});}return out.sort((a,b)=>a.km-b.km).slice(0,40);}
 function draw(){if(routeLayer)map.removeLayer(routeLayer);routeLayer=L.geoJSON(route.geometry,{style:{weight:5}}).addTo(map);map.fitBounds(routeLayer.getBounds(),{padding:[15,15]});if(destMarker)map.removeLayer(destMarker);destMarker=L.marker([route.dest.lat,route.dest.lon]).addTo(map).bindPopup(`目的地: ${route.dest.label||'目的地'}`);}
