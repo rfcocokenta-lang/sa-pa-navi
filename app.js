@@ -54,27 +54,50 @@ function chooseHighwayRoute(routes){
 }
 
 async function getSpots(rt){
-  const cs=rt.geometry.coordinates, lat=cs.map(c=>c[1]), lon=cs.map(c=>c[0]);
-  const s=Math.min(...lat)-.08,n=Math.max(...lat)+.08,w=Math.min(...lon)-.08,e=Math.max(...lon)+.08;
-  // OSMの「services/rest_area」は道の駅なども含み得るため、SA/PA名称を持つものだけ採用。
-  const q=`[out:json][timeout:30];nwr["highway"~"^(services|rest_area)$"]["name"~"(SA|PA|サービスエリア|パーキングエリア)",i](${s},${w},${n},${e});out center tags;`;
+  const cs=rt.geometry.coordinates;
+  const lat=cs.map(c=>c[1]), lon=cs.map(c=>c[0]);
+  // ルートから離れた「道の駅・駐車場・ラウンジ」等を拾わないよう、検索範囲を狭める。
+  const s=Math.min(...lat)-.03,n=Math.max(...lat)+.03,w=Math.min(...lon)-.03,e=Math.max(...lon)+.03;
+  const q=`[out:json][timeout:30];nwr["highway"~"^(services|rest_area)$"](${s},${w},${n},${e});out center tags;`;
   const r=await fetch('https://overpass-api.de/api/interpreter',{method:'POST',headers:{'Content-Type':'text/plain'},body:q});
   if(!r.ok) throw Error('SA・PAデータを取得できませんでした');
   const d=await r.json(), cc=cum(cs), total=cc.at(-1), out=[];
+
+  // 明らかなSA/PA以外を除外。OSMでは services/rest_area に道の駅等が混ざるため、
+  // 名称だけでなく除外語・SA/PA語を両方チェックする。
+  const include=/(サービスエリア|パーキングエリア|\bSA\b|\bPA\b|SA・PA|ＳＡ|ＰＡ)/i;
+  const exclude=/(道の駅|コインパーキング|駐車場|VIP|ラウンジ|ロータリー|バス停|ガソリンスタンド|サービスステーション)/i;
+
   for(const x of d.elements||[]){
-    const la=x.lat??x.center?.lat,lo=x.lon??x.center?.lon;if(la==null) continue;
-    const z=nearestOnRoute(rt,la,lo); if(z.d>1800) continue;
-    const name=x.tags?.name||x.tags?.['name:ja']; if(!name) continue;
-    const m=name.match(/(.*?)(?:\s*\(|\s*（)?(上り|下り|外回り|内回り)?[）)]?$/);
-    const type=/\bSA\b|サービスエリア/i.test(name)?'SA':'PA';
+    const la=x.lat??x.center?.lat, lo=x.lon??x.center?.lon;
+    if(la==null || lo==null) continue;
+    const tags=x.tags||{};
+    const name=tags.name||tags['name:ja']||'';
+    const ja=tags['name:ja']||name;
+    if(!name && !ja) continue;
+    const label=ja||name;
+    if(exclude.test(label)) continue;
+    if(!include.test(name) && !include.test(ja)) continue;
+
+    // ルート上への距離を厳しく制限。1.8kmでは一般道の施設まで混ざるため、350m以内だけ採用。
+    const z=nearestOnRoute(rt,la,lo);
+    if(z.d>350) continue;
     const km=cc[z.i]/1000;
     if(km<1 || km>total/1000-1) continue;
-    if(out.some(v=>hav([v.lat,v.lon],[la,lo])<700)) continue;
-    out.push({name,type,lat:la,lon:lo,km,roadDist:z.d});
+
+    // 上り/下り・東行き/西行き等の表記は残す。
+    let type='PA';
+    if(/サービスエリア|\bSA\b|ＳＡ/i.test(label) && !/パーキングエリア|\bPA\b|ＰＡ/i.test(label)) type='SA';
+    if(/SA・PA/i.test(label)) type='PA';
+
+    // 同一施設の複数ノードをまとめる。
+    if(out.some(v=>hav([v.lat,v.lon],[la,lo])<500)) continue;
+    out.push({name:label,type,lat:la,lon:lo,km,roadDist:z.d});
   }
+
+  // ルート上の順番で並べ、現在地より前の施設は render() 側で除外する。
   return out.sort((a,b)=>a.km-b.km).slice(0,40);
 }
-
 function draw(){
   if(routeLayer) map.removeLayer(routeLayer);
   routeLayer=L.geoJSON(route.geometry,{style:{weight:5}}).addTo(map);
