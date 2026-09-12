@@ -72,8 +72,29 @@ async function geocode(q){return (await geocodeCandidates(q))[0];}
 async function osrm(a,b,extra=''){const u=`https://router.project-osrm.org/route/v1/driving/${a.lon},${a.lat};${b.lon},${b.lat}?overview=full&geometries=geojson&steps=true&alternatives=true${extra}`;const r=await fetch(u);if(!r.ok)throw Error('ルートAPIに接続できませんでした');const d=await r.json();if(d.code!=='Ok'||!d.routes?.length)throw Error('ルートが見つかりませんでした');return d.routes;}
 async function osrmVia(points,extra=''){const coords=points.map(p=>`${p.lon},${p.lat}`).join(';');const u=`https://router.project-osrm.org/route/v1/driving/${coords}?overview=full&geometries=geojson&steps=true&alternatives=false&continue_straight=true${extra}`;const r=await fetch(u);if(!r.ok)return null;const d=await r.json();return d.code==='Ok'&&d.routes?.[0]?d.routes[0]:null;}
 function motorwayScore(rt){let motorway=0,trunk=0,total=0,expressHint=0;for(const leg of rt.legs||[])for(const st of leg.steps||[]){const km=st.distance||0;total+=km;const cls=st.classes||[];const txt=`${st.name||''} ${st.ref||''}`;if(cls.includes('motorway'))motorway+=km;else if(cls.includes('trunk'))trunk+=km;if(/首都高|高速|アクアライン|館山道|富津館山|湾岸|東関東|京葉道路|常磐道|東北道|関越道|中央道|E\d{1,2}/.test(txt))expressHint+=km;}const ratio=total?Math.max((motorway+trunk)/total,expressHint/total):0;return{motorway,trunk,total,ratio};}
-function roadNames(rt){const a=[];for(const leg of rt.legs||[])for(const st of leg.steps||[]){const n=st.name||st.ref;if(n&&!a.includes(n))a.push(n);if(a.length>=5)break;}return a;}
-function classifyRoute(rt,i,kind='auto',meta={}){const s=meta.ratio!=null?{ratio:meta.ratio,total:rt.distance||0}:motorwayScore(rt);let name=kind==='highway'?'高速道路優先':kind==='general'?'一般道中心':(s.ratio>=.65?'高速道路優先':s.ratio>=.35?'高速＋一般道':'一般道中心');return{rt,name,tag:i===0?'おすすめ':'別ルート',mins:Math.round(rt.duration/60),km:(rt.distance/1000).toFixed(1),ratio:s.ratio,roads:meta.roads||roadNames(rt).join(' → '),kind};}
+function roadNames(rt){
+  const a=[];
+  const add=n=>{if(!n)return; n=String(n).trim(); if(!n)return; if(!a.includes(n))a.push(n);};
+  for(const leg of rt.legs||[]){
+    for(const st of leg.steps||[]){
+      const name=(st.name||'').trim();
+      const ref=(st.ref||'').trim();
+      const combined=name&&ref&&name!==ref?`${name} (${ref})`:name||ref;
+      add(combined);
+      if(a.length>=8)break;
+    }
+    if(a.length>=8)break;
+  }
+  return a.join(' → ');
+}
+function routeRoadSummary(rt,kind){
+  const roads=roadNames(rt);
+  if(roads)return roads;
+  if(kind==='highway')return '高速道路経由（道路名取得なし）';
+  if(kind==='general')return '一般道経由（道路名取得なし）';
+  return '道路名取得なし';
+}
+function classifyRoute(rt,i,kind='auto',meta={}){const s=meta.ratio!=null?{ratio:meta.ratio,total:rt.distance||0}:motorwayScore(rt);let name=kind==='highway'?'高速道路優先':kind==='general'?'一般道中心':(s.ratio>=.65?'高速道路優先':s.ratio>=.35?'高速＋一般道':'一般道中心');return{rt,name,tag:i===0?'おすすめ':'別ルート',mins:Math.round(rt.duration/60),km:(rt.distance/1000).toFixed(1),ratio:s.ratio,roads:meta.roads||routeRoadSummary(rt,kind),kind};}
 function decodePolyline6(str){let idx=0,lat=0,lon=0,out=[];while(idx<str.length){let b,shift=0,result=0;do{b=str.charCodeAt(idx++)-63;result|=(b&31)<<shift;shift+=5;}while(b>=32);lat+=result&1?~(result>>1):result>>1;shift=0;result=0;do{b=str.charCodeAt(idx++)-63;result|=(b&31)<<shift;shift+=5;}while(b>=32);lon+=result&1?~(result>>1):result>>1;out.push([lon/1e6,lat/1e6]);}return out;}
 function valhallaShape(trip){const coords=[];for(const leg of trip.legs||[]){const sh=leg.shape;if(Array.isArray(sh)){for(const p of sh)coords.push(Array.isArray(p)?p:[p.lon,p.lat]);}
  else if(sh&&Array.isArray(sh.coordinates))coords.push(...sh.coordinates);
@@ -159,7 +180,7 @@ async function getRoutes(a,b){
     const forced=await buildForcedHighwayRoutes(a,b);
     if(forced.length){
       const best=forced[0];
-      const o=classifyRoute(best.rt,0,'highway',{ratio:best.ratio,roads:roadNames(best.rt).join(' → ')});
+      const o=classifyRoute(best.rt,0,'highway',{ratio:best.ratio,roads:routeRoadSummary(best.rt,'highway')});
       o.name='高速道路優先'; o.kind='highway'; o.tag='おすすめ';
       candidates.push(o); seenKinds.add('highway');
     }
@@ -195,7 +216,7 @@ async function getRoutes(a,b){
       for(const v of vs){
         if(candidates.some(o=>o.kind===v.kind))continue;
         const o=classifyRoute(v.rt,candidates.length,v.kind==='highway'?'highway':v.kind==='general'?'general':'auto',{
-          ratio:v.ratio,roads:roadNames(v.rt).join(' → ')||v.label
+          ratio:v.ratio,roads:routeRoadSummary(v.rt,v.kind)||v.label
         });
         o.name=v.label; o.kind=v.kind; o.tag=o.kind==='highway'?'おすすめ':'別ルート';
         candidates.push(o);
