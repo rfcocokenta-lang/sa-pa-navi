@@ -1,13 +1,17 @@
-# v0.17 更新手順
+# SA・PAナビ v0.19 デプロイ
 
-今回のv0.17は、古いapp.jsがブラウザキャッシュで残る問題を避けるため、`app-v17.js` と `style-v17.css` を新しいファイル名で読み込みます。
+GitHub Pages のリポジトリに次の3ファイルを配置してください。
 
-GitHub Pagesの公開フォルダに以下4ファイルを同じ階層で置き換えてください。
 - index.html
-- app-v17.js
-- style-v17.css
-- README.md（任意）
+- app-v19.js
+- style-v19.css
 
-`index.html` は app-v17.js / style-v17.css を参照しています。
+`index.html` は app-v19.js / style-v19.css を読み込むようになっています。
+古い app.js / style.css / app-v18.js / style-v18.css は残しても動作には影響しません。
 
-検索結果のルートカードには、道路step情報から判定した「一般道→高速→一般道」の区間と、高速道路開始・終了位置が表示されます。
+## v0.19の主な修正
+- 一般道候補は OSRM alternatives の中から高速道路比率が低い候補を優先。
+- 高速IC取得が一時失敗しても OSRM alternatives から高速候補を復旧。
+- SA/PA検索を5km間隔の小さいOverpass検索に変更。
+- Overpass障害時は東京湾～館山方面の主要SA/PAをフォールバック。
+- 高速区間の地図色表示は継続。
